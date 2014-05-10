@@ -958,7 +958,7 @@ Cmd_nano(int argc, char *argv[])
     uint8_t fmtHeader[80];
 
     elementT * bufData;
-    uint8_t i;
+    uint16_t i;
 
     stop = false;
 
@@ -1031,6 +1031,11 @@ Cmd_nano(int argc, char *argv[])
       bufData = bufGet(gpBuf);
 
       if (bufData) {
+        // TODO Process data to match with wave format
+        for (i = 0; i < 512; i++) {
+          bufData->data[i] -= 2048;
+        }
+
         iFResult = f_write(&g_sFileObject, bufData->data,
                            elementSize*2, (UINT *)&bw);
 
