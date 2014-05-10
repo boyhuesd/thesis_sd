@@ -27,7 +27,6 @@
 #include <string.h>
 #include "inc/hw_memmap.h"
 #include "inc/hw_types.h"
-#include "inc/hw_memmap.h"
 #include "inc/hw_adc.h"
 #include "inc/hw_ints.h"
 #include "driverlib/fpu.h"
@@ -47,8 +46,8 @@
 #include "fatfs/src/diskio.h"
 #include "cirbuf.h"
 #include "format.h"
+#include "dac.h"
 
-#define SYS_CLK 80000000UL
 #define _CAT
 
 //*****************************************************************************
@@ -102,6 +101,10 @@ uint8_t controlTable[1024];
 //
 //*****************************************************************************
 volatile uint32_t uDMAErrorCounter = 0;
+
+// DAC output variables
+volatile uint16_t dacIndex = 0;
+volatile elementT * dacBuf;
 
 void uDMAErrorHandler(void)
 {
@@ -806,18 +809,22 @@ Cmd_cat(int argc, char *argv[])
 {
     FRESULT iFResult;
     uint32_t ui32BytesRead;
-#ifndef _CAT
-    uint8_t buf[256];
+
+    uint32_t numOfSamples;
+    uint32_t subChunk2Size; // Wave subchunksize data
+    uint32_t chunkSize;
+    uint32_t count = 0; // Number of elements to acquire
+    uint32_t filesize = 0;
+    uint32_t numOfByteToRead;
+
+    uint8_t fmtHeader[80];
+
+    elementT * bufData;
     uint8_t i;
 
-    //
-    // Fill buffer with data
-    //
-    for (i = 0; i < sizeof(buf) - 1; i++)
-    {
-      buf[i] = i;
-    }
-#endif
+    stop = false;
+
+    bufInit(gpBuf);
 
     //
     // First, check to make sure that the current path (CWD), plus the file
@@ -848,18 +855,12 @@ Cmd_cat(int argc, char *argv[])
     // Now finally, append the file name to result in a fully specified file.
     //
     strcat(g_pcTmpBuf, argv[1]);
-#ifdef _CAT
+
     //
     // Open the file for reading.
     //
     iFResult = f_open(&g_sFileObject, g_pcTmpBuf, FA_READ);
-#else
-    //
-    // Open the file for writing.
-    //
-    iFResult = f_open(&g_sFileObject, g_pcTmpBuf, FA_WRITE |
-                      FA_OPEN_ALWAYS);
-#endif
+
     //
     // If there was some problem opening the file, then return an error.
     //
@@ -868,59 +869,72 @@ Cmd_cat(int argc, char *argv[])
         return((int)iFResult);
     }
 
-#ifdef _CAT
-    //
-    // Enter a loop to repeatedly read data from the file and display it, until
-    // the end of the file is reached.
-    //
-    do
-    {
 
-        //
-        // Read a block of data from the file.  Read as much as can fit in the
-        // temporary buffer, including a space for the trailing null.
-        //
-        iFResult = f_read(&g_sFileObject, g_pcTmpBuf, sizeof(g_pcTmpBuf) - 1,
-                          (UINT *)&ui32BytesRead);
+    // 0. Read the file size
+    filesize = f_size(&g_sFileObject);
 
+    // 1. Read the WAV file header
+    iFResult = f_read(&g_sFileObject, fmtHeader, 44, (UINT *)&ui32BytesRead);
+    if (iFResult != FR_OK) {
+      return ((int) iFResult);
+    }
 
-        //
-        // If there was an error reading, then print a newline and return the
-        // error to the user.
-        //
-        if(iFResult != FR_OK)
-        {
-            UARTprintf("\n");
-            return((int)iFResult);
+    subChunk2Size = ((uint32_t) fmtHeader[43] << 24) |
+                    ((uint32_t) fmtHeader[42] << 16) |
+                    ((uint32_t) fmtHeader[41] << 8) |
+                    (uint32_t) fmtHeader[40];
+
+    filesize -= 44; // Removed header
+
+    // Seek to the location of the first sample data
+    iFResult = f_lseek(&g_sFileObject, 44);
+    if (iFResult != FR_OK) {
+      return ((int) iFResult);
+    }
+
+    // Get a free buffer and preload first sector
+    bufData = bufGetFree(gpBuf);
+    iFResult = f_read(&g_sFileObject, bufData->data, 1024, (UINT *)&ui32BytesRead);
+    if (iFResult != FR_OK) {
+      return ((int) iFResult);
+    }
+
+    // Remember to set the buffer element FREE after using it
+    bufItemSetFree(gpBuf, bufData->index);
+
+    // Preload data
+    dacBuf = bufGet(gpBuf);
+
+    // Enable DAC
+    dacEnable();
+
+    // Loop to read data from the file
+    while (!stop) {
+      // Get a free buffer
+      bufData = bufGetFree(gpBuf);
+
+      // If there is free room for new data
+      if (bufData) {
+        if (filesize > 1024) {
+          filesize -= 1024;
+
+          // Read data to the buffer
+          iFResult = f_read(&g_sFileObject, bufData->data, 1024, (UINT *)&ui32BytesRead);
+          if (iFResult != FR_OK) {
+            return ((int) iFResult);
+          }
+
+          bufItemSetFree(gpBuf, bufData->index);
         }
-
-        //
-        // Null terminate the last block that was read to make it a null
-        // terminated string that can be used with printf.
-        //
-        g_pcTmpBuf[ui32BytesRead] = 0;
-
-        //
-        // Print the last chunk of the file that was received.
-        //
-        UARTprintf("%s", g_pcTmpBuf);
-    }
-    while(ui32BytesRead == sizeof(g_pcTmpBuf) - 1);
-#else
-    do {
-      iFResult = f_write(&g_sFileObject, buf, sizeof(buf) - 1,
-                         (UINT *)&ui32BytesRead);
-
-      if(iFResult != FR_OK)
-      {
-          UARTprintf("not ok\n");
-          return((int)iFResult);
+        else {
+          iFResult = f_read(&g_sFileObject, bufData->data, filesize, (UINT *)&ui32BytesRead);
+          stop = true; // End of file, ok to stop
+        }
       }
-    }
-    while (ui32BytesRead < sizeof(buf) - 1);
-    f_close(&g_sFileObject);
 
-#endif
+
+    }
+
     //
     // Return success.
     //
@@ -936,7 +950,6 @@ Cmd_nano(int argc, char *argv[])
 {
     FRESULT iFResult;
     UINT bw;
-    bool stop; // Stop action token
     uint32_t numOfSamples;
     uint32_t subChunk2Size; // Wave subchunksize data
     uint32_t chunkSize;
@@ -1204,8 +1217,6 @@ main(void)
     int nStatus;
     FRESULT iFResult;
 
-    uint32_t clk;
-
     //
     // Enable lazy stacking for interrupt handlers.  This allows floating-point
     // instructions to be used within interrupt handlers, but at the expense of
@@ -1251,6 +1262,9 @@ main(void)
     // Setup data acquisition
     acqConfig();
 
+    // Setup DAC
+    dacSetup();
+
     //
     // Print hello message to user.
     //
@@ -1267,7 +1281,6 @@ main(void)
         return(1);
     }
 
-    clk = ROM_SysCtlClockGet();
 
     //
     // Enter an infinite loop for reading and processing commands from the

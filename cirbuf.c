@@ -23,7 +23,14 @@ void bufInit(volatile bufT * buf) {
 }
 
 bool bufIsFull(volatile bufT * buf) {
-  return (buf->count >= bufSize);
+  uint8_t i, t = 0;
+
+  for (i = 0; i < bufSize; i++) {
+    if (buf->item[i].status != FREE) {
+      t++;
+    }
+  }
+  return ((buf->count + t) >= bufSize);
 }
 
 bool bufIsEmpty(volatile bufT * buf) {
