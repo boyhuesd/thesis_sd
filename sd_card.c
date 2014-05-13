@@ -982,8 +982,8 @@ Cmd_nano(int argc, char *argv[])
   static float32_t inputf32[LENGTH]; // Filter inputs
   static float32_t outputf32[LENGTH]; // Filter output
   static float32_t firBufferf32[BLOCK_SIZE + TAPS - 1]; // Buffer state // todo fix
-  static int16_t bufferOutputi16[2048];
-  static int16_t outputi16[512];
+  //static int16_t bufferOutputi16[2048];
+  static int16_t outputi16[LENGTH];
 
   // Filter kernel structure
   static arm_fir_instance_f32 s;
@@ -1094,23 +1094,14 @@ Cmd_nano(int argc, char *argv[])
           arm_fir_f32(&s, input + (i * blocksize), output + (i * blocksize),
                      (uint32_t) blocksize);
         }
-        timesDone++;
-        //UARTprintf("%d\n", timesDone);
-        //UARTprintf("DONE!\n");
-        //while(1);
 
         // Convert and copy the filtered output to the buffer array
-        for (i = 0; i < 512; i++) {
-          bufferOutputi16[t*512 + i] = (outputf32[i] * INT16_MAX);
+        for (i = 0; i < 128; i++) {
+          outputi16[t*128 + i] = outputf32[i * 4] * INT16_MAX;
         }
 
         t++;
       }
-    }
-
-    // Get only 1 per 4 samples (downsampling)
-    for (i = 0; i < 512; i++) {
-      outputi16[i] = bufferOutputi16[i * 4];
     }
 
     // Write data to the disk

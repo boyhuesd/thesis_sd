@@ -13,7 +13,7 @@
 #include <stdbool.h>
 
 enum {
-  bufSize = 10,
+  bufSize = 12,
   elementSize = 512
 };
 
