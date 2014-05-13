@@ -55,7 +55,8 @@ void dacIntHandler(void) {
 
   // Output the DAC value
   if (dacBuf) {
-    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_4, (dacBuf->data[dacIndex]>>2));
+    // Data now in int16 format, must add 2048 before output
+    PWMPulseWidthSet(PWM0_BASE, PWM_OUT_4, (dacBuf->data[dacIndex] + 2048)>>2);
   }
   else {
     if (stop) {

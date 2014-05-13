@@ -8,6 +8,8 @@
 #ifndef GLOBAL_H_
 #define GLOBAL_H_
 
+#include "stdint.h"
+
 #define SYS_CLK 80000000UL
 
 #endif /* GLOBAL_H_ */

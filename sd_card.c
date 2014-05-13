@@ -48,6 +48,10 @@
 #include "format.h"
 #include "dac.h"
 
+// CMSIS
+#include "arm_math.h"
+#include "fir_filter.h"
+
 #define _CAT
 
 //*****************************************************************************
@@ -101,6 +105,9 @@ uint8_t controlTable[1024];
 //
 //*****************************************************************************
 volatile uint32_t uDMAErrorCounter = 0;
+volatile uint8_t sysTickTest = 0;
+// TEST VARIABLES
+volatile uint32_t doneTimes = 0;
 
 // DAC output variables
 volatile uint16_t dacIndex = 0;
@@ -196,7 +203,7 @@ void acqConfig(void) {
     TimerConfigure(TIMER0_BASE, TIMER_CFG_PERIODIC);
 
     // Set timer to trigger ADC at rate 8000Hz
-    TimerLoadSet(TIMER0_BASE, TIMER_A, SYS_CLK/8000);
+    TimerLoadSet(TIMER0_BASE, TIMER_A, SYS_CLK/32000); // 32ksps
 
     // Trigger ADC using timer
     TimerControlTrigger(TIMER0_BASE, TIMER_A, 1);
@@ -243,6 +250,7 @@ void adcInterruptHandler(void)
     }
     else {
       bufferOverflow = true;
+      while(1);
     }
 
 
@@ -269,12 +277,15 @@ void adcInterruptHandler(void)
     }
     else {
       bufferOverflow = true;
+      while(1);
     }
 
     // Toggle the Pin
     //GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_1,
     //             (uint8_t) (GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_1)) ^ ((1 << 1)));
   }
+
+  doneTimes++;
 
 }
 
@@ -470,6 +481,12 @@ SysTickHandler(void)
     // Call the FatFs tick timer.
     //
     disk_timerproc();
+    sysTickTest++;
+    if (sysTickTest == 2 ) {
+      GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, (GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_2) ^ GPIO_PIN_2));
+
+      sysTickTest = 0;
+    }
 }
 
 //*****************************************************************************
@@ -948,151 +965,207 @@ Cmd_cat(int argc, char *argv[])
 int
 Cmd_nano(int argc, char *argv[])
 {
-    FRESULT iFResult;
-    UINT bw;
-    uint32_t numOfSamples;
-    uint32_t subChunk2Size; // Wave subchunksize data
-    uint32_t chunkSize;
-    uint32_t count = 0; // Number of elements to acquire
+  FRESULT iFResult;
+  UINT bw;
+  uint32_t numOfSamples;
+  uint32_t subChunk2Size; // Wave subchunksize data
+  uint32_t chunkSize;
+  uint32_t count; // Number of elements to acquire
 
-    uint8_t fmtHeader[80];
+  static uint8_t fmtHeader[80];
 
-    elementT * bufData;
-    uint16_t i;
+  static elementT * bufData;
+  uint16_t i;
+  uint8_t t;
 
-    stop = false;
+  // Data filtering helper arrays
+  static float32_t inputf32[LENGTH]; // Filter inputs
+  static float32_t outputf32[LENGTH]; // Filter output
+  static float32_t firBufferf32[BLOCK_SIZE + TAPS - 1]; // Buffer state // todo fix
+  static int16_t bufferOutputi16[2048];
+  static int16_t outputi16[512];
 
-    // Copy header from format.h
-    for (i = 0; i < 44; i++) {
-      fmtHeader[i] = wavHeader[i];
-    };
+  // Filter kernel structure
+  static arm_fir_instance_f32 s;
+  static uint32_t blocksize = BLOCK_SIZE;
+  uint8_t timesDone = 0;
+  uint8_t numOfBlocks = LENGTH/blocksize;
 
-    // Init the buffer
-    bufInit(gpBuf);
+  static float32_t *input, *output;
+  input = inputf32;
+  output = outputf32;
 
-    // First, check to make sure that the current path (CWD), plus the file
-    // name, plus a separator and trailing null, will all fit in the temporary
-    // buffer that will be used to hold the file name.  The file name must be
-    // fully specified, with path, to FatFs.
-    if(strlen(g_pcCwdBuf) + strlen(argv[1]) + 1 + 1 > sizeof(g_pcTmpBuf))
-    {
-        UARTprintf("Resulting path name is too long\n");
-        return(0);
-    }
+  //
+  // FIR filter initialization
+  //
+  arm_fir_init_f32(&s, TAPS, (float32_t *) &firCoeffsf32[0], &firBufferf32[0], blocksize);
 
-    //
-    // Copy the current path to the temporary buffer so it can be manipulated.
-    //
-    strcpy(g_pcTmpBuf, g_pcCwdBuf);
+  // Stop action
+  stop = false;
+  count = 0;
 
-    //
-    // If not already at the root level, then append a separator.
-    //
-    if(strcmp("/", g_pcCwdBuf))
-    {
-        strcat(g_pcTmpBuf, "/");
-    }
+  // Copy header from format.h
+  for (i = 0; i < 44; i++) {
+    fmtHeader[i] = wavHeader[i];
+  };
 
-    //
-    // Now finally, append the file name to result in a fully specified file.
-    //
-    strcat(g_pcTmpBuf, argv[1]);
-    //
-    // Open the file for writing.
-    //
-    iFResult = f_open(&g_sFileObject, g_pcTmpBuf, FA_WRITE |
-                      FA_OPEN_ALWAYS);
-    //
-    // If there was some problem opening the file, then return an error.
-    //
+  // Init the buffer
+  bufInit(gpBuf);
+  acqConfig();
+
+  // First, check to make sure that the current path (CWD), plus the file
+  // name, plus a separator and trailing null, will all fit in the temporary
+  // buffer that will be used to hold the file name.  The file name must be
+  // fully specified, with path, to FatFs.
+  if(strlen(g_pcCwdBuf) + strlen(argv[1]) + 1 + 1 > sizeof(g_pcTmpBuf))
+  {
+      UARTprintf("Resulting path name is too long\n");
+      return(0);
+  }
+
+  //
+  // Copy the current path to the temporary buffer so it can be manipulated.
+  //
+  strcpy(g_pcTmpBuf, g_pcCwdBuf);
+
+  //
+  // If not already at the root level, then append a separator.
+  //
+  if(strcmp("/", g_pcCwdBuf))
+  {
+      strcat(g_pcTmpBuf, "/");
+  }
+
+  //
+  // Now finally, append the file name to result in a fully specified file.
+  //
+  strcat(g_pcTmpBuf, argv[1]);
+  //
+  // Open the file for writing.
+  //
+  iFResult = f_open(&g_sFileObject, g_pcTmpBuf, FA_WRITE | FA_OPEN_ALWAYS);
+  //
+  // If there was some problem opening the file, then return an error.
+  //
+  if(iFResult != FR_OK)
+  {
+      return((int)iFResult);
+  }
+
+  // Allocate space for WAV header
+  do {
+    iFResult = f_write(&g_sFileObject, fmtHeader, 44,
+                       (UINT *)&bw);
+
     if(iFResult != FR_OK)
     {
+        UARTprintf("not ok\n");
         return((int)iFResult);
     }
+  }
+  while (bw < 44);
 
-    // Allocate space for WAV header
-    do {
-      iFResult = f_write(&g_sFileObject, fmtHeader, 44,
-                         (UINT *)&bw);
+  // Enable timer for data acquisition
+  TimerEnable(TIMER0_BASE, TIMER_A);
 
-      if(iFResult != FR_OK)
-      {
-          UARTprintf("not ok\n");
-          return((int)iFResult);
-      }
-    }
-    while (bw < 44);
-
-    // Enable timer for data acquisition
-    TimerEnable(TIMER0_BASE, TIMER_A);
-
-    // Check the buffer and write data to the disk
-    while (!stop) {
+  // Check the buffer and write data to the disk
+  while (!stop) {
+    t = 0;
+    while (t < 4) {
       bufData = bufGet(gpBuf);
 
+      // If data available at the buffer, process it
       if (bufData) {
-        // TODO Process data to match with wave format
+        // WAVE file format compatibility
         for (i = 0; i < 512; i++) {
           bufData->data[i] -= 2048;
+
+        // Convert from int16 to f32 and copy to new array
+        inputf32[i] = ((float32_t) (bufData->data[i]) / INT16_MAX);
         }
 
-        iFResult = f_write(&g_sFileObject, bufData->data,
-                           elementSize*2, (UINT *)&bw);
+        // Update status of the element used
+        bufData->status = FREE;
 
-        if (iFResult != FR_OK) {
-          return ((int) iFResult);
-        }
-        else {
-          // Update status of the element used
-          bufData->status = FREE;
-          count++;
-        }
-      }
+        //UARTprintf("Begin filter!\n");
 
-      if (count >= 500) { // Stop token
-        stop = true;
+        // Filter it and save to the temporary buffer
+        for (i = 0; i < numOfBlocks; i++) {
+          arm_fir_f32(&s, input + (i * blocksize), output + (i * blocksize),
+                     (uint32_t) blocksize);
+        }
+        timesDone++;
+        //UARTprintf("%d\n", timesDone);
+        //UARTprintf("DONE!\n");
+        //while(1);
+
+        // Convert and copy the filtered output to the buffer array
+        for (i = 0; i < 512; i++) {
+          bufferOutputi16[t*512 + i] = (outputf32[i] * INT16_MAX);
+        }
+
+        t++;
       }
     }
 
-    // Disable timer
-    TimerDisable(TIMER0_BASE, TIMER_A);
-
-    // Calulate chunksizes
-    numOfSamples = count; // TODO This is temporary
-    subChunk2Size = numOfSamples * 2 * 512;
-    chunkSize  = subChunk2Size + 36;
-
-    // Modify header Chunk Size
-    fmtHeader[4] = (uint8_t) chunkSize;
-    fmtHeader[5] = (uint8_t) (chunkSize >> 8);
-    fmtHeader[6] = (uint8_t) (chunkSize >> 16);
-    fmtHeader[7] = (uint8_t) (chunkSize >> 24);
-
-    // Modify header Sub Chunk 2 Size
-    fmtHeader[40] = (uint8_t) subChunk2Size;
-    fmtHeader[41] = (uint8_t) (subChunk2Size >> 8);
-    fmtHeader[42] = (uint8_t) (subChunk2Size >> 16);
-    fmtHeader[43] = (uint8_t) (subChunk2Size >> 24);
-
-    // Seek to the first location of the file and write the wav header
-    iFResult = f_lseek(&g_sFileObject, 0);
-    if(iFResult != FR_OK)
-    {
-        return((int)iFResult);
+    // Get only 1 per 4 samples (downsampling)
+    for (i = 0; i < 512; i++) {
+      outputi16[i] = bufferOutputi16[i * 4];
     }
 
-    iFResult = f_write(&g_sFileObject, fmtHeader, 44, (UINT *)&bw);
+    // Write data to the disk
+    iFResult = f_write(&g_sFileObject, outputi16, elementSize*2, (UINT *)&bw);
 
     if (iFResult != FR_OK) {
       return ((int) iFResult);
     }
 
-    f_close(&g_sFileObject);
+    count++;
 
-    //
-    // Return success.
-    //
-    return(0);
+    if (count >= 2000) { // Stop token
+      stop = true;
+    }
+  }
+
+  // Disable timer
+  TimerDisable(TIMER0_BASE, TIMER_A);
+
+  // Calulate chunksizes
+  numOfSamples = count; // TODO This is temporary
+  subChunk2Size = numOfSamples * 2 * 512;
+  chunkSize  = subChunk2Size + 36;
+
+  // Modify header Chunk Size
+  fmtHeader[4] = (uint8_t) chunkSize;
+  fmtHeader[5] = (uint8_t) (chunkSize >> 8);
+  fmtHeader[6] = (uint8_t) (chunkSize >> 16);
+  fmtHeader[7] = (uint8_t) (chunkSize >> 24);
+
+  // Modify header Sub Chunk 2 Size
+  fmtHeader[40] = (uint8_t) subChunk2Size;
+  fmtHeader[41] = (uint8_t) (subChunk2Size >> 8);
+  fmtHeader[42] = (uint8_t) (subChunk2Size >> 16);
+  fmtHeader[43] = (uint8_t) (subChunk2Size >> 24);
+
+  // Seek to the first location of the file and write the wav header
+  iFResult = f_lseek(&g_sFileObject, 0);
+  if(iFResult != FR_OK)
+  {
+      return((int)iFResult);
+  }
+
+  iFResult = f_write(&g_sFileObject, fmtHeader, 44, (UINT *)&bw);
+
+  if (iFResult != FR_OK) {
+    return ((int) iFResult);
+  }
+
+  f_close(&g_sFileObject);
+
+  //
+  // Return success.
+  //
+  return(0);
 }
 
 //*****************************************************************************
@@ -1206,8 +1279,6 @@ ConfigureUART(void)
     // Initialize the UART for console I/O.
     //
     UARTStdioConfig(0, 115200, 16000000);
-    //
-    UARTStdioConfig(0, 115200, 16000000);
 }
 
 //*****************************************************************************
@@ -1269,6 +1340,13 @@ main(void)
 
     // Setup DAC
     dacSetup();
+
+    // TEST SECTION
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_2);
+
+    GPIOPinWrite(GPIO_PORTF_BASE, GPIO_PIN_2, ~GPIO_PIN_2);
+    // END TEST SECTION
 
     //
     // Print hello message to user.
@@ -1336,5 +1414,3 @@ main(void)
         }
     }
 }
-
-// TODO Need to test cirular buffer with DMA before implementing it on real hardware

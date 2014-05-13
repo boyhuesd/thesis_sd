@@ -122,9 +122,6 @@ elementT * bufGet(volatile bufT * buf) {
     return 0;
   }
   else {
-    // Decrease element counter
-    buf->count--;
-
     i = bufIS(buf->rear);
 
     // Check for availability before returning
@@ -132,6 +129,9 @@ elementT * bufGet(volatile bufT * buf) {
       return 0;
     }
     else {
+      // Decrease element counter
+      buf->count--;
+
       // Set element status in READING
       buf->item[i].status = READ;
 
